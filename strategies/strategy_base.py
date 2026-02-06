@@ -65,6 +65,94 @@ class Strategy:
         df = self.generate_signals(df)
         return df
 
+#Adjust Classes/Param as Needed (Jaden Cai test strategy)
+class AlgTopo(Strategy):
+    """
+    Algebraic Topology Trading Strategy using Persistent Homology concepts.
+    
+    Key ideas:
+    - Signals that persist across multiple timeframes (scales) are stronger
+    - Multi-scale momentum: detects trends visible at 3, 5, and 7-period scales
+    - Persistence filtering: only trades when signal is consistent across scales
+    - Volatility-normalized momentum: adjusts for market regime changes
+    
+    For short-term trading, this captures trends that actually matter (persistent patterns)
+    while filtering out noise.
+    """
+
+    def __init__(self, position_size: float = 10.0, min_persistence: int = 2):
+        """
+        Args:
+            position_size: shares to trade
+            min_persistence: number of scales where signal must agree (1-3)
+        """
+        if position_size <= 0:
+            raise ValueError("position_size must be positive.")
+        if min_persistence < 1 or min_persistence > 3:
+            raise ValueError("min_persistence must be 1-3.")
+        self.position_size = position_size
+        self.min_persistence = min_persistence
+    
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Basic returns and volatility
+        df["returns"] = df["Close"].pct_change().fillna(0.0)
+        df["volatility"] = df["returns"].rolling(14).std().fillna(0.0)
+        
+        # Multi-scale momentum (topological persistence across timeframes)
+        # These are like "homology groups" at different scales
+        df["mom_fast"] = df["Close"].pct_change(3).fillna(0.0)      # 3-period
+        df["mom_mid"] = df["Close"].pct_change(5).fillna(0.0)       # 5-period
+        df["mom_slow"] = df["Close"].pct_change(7).fillna(0.0)      # 7-period
+        
+        # Volatility-normalized momentum (adjust signal strength for market regime)
+        df["volatility_normalized"] = df["volatility"].rolling(20).mean().fillna(0.01)
+        df["mom_fast_norm"] = df["mom_fast"] / (df["volatility_normalized"] + 0.0001)
+        df["mom_mid_norm"] = df["mom_mid"] / (df["volatility_normalized"] + 0.0001)
+        df["mom_slow_norm"] = df["mom_slow"] / (df["volatility_normalized"] + 0.0001)
+        
+        return df
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Vectorized persistence counting - pure numpy, no loops
+        bullish_scales = (
+            (df["mom_fast_norm"] > 0.3).astype(int) +
+            (df["mom_mid_norm"] > 0.15).astype(int) +
+            (df["mom_slow_norm"] > 0.1).astype(int)
+        )
+        bearish_scales = (
+            (df["mom_fast_norm"] < -0.3).astype(int) +
+            (df["mom_mid_norm"] < -0.15).astype(int) +
+            (df["mom_slow_norm"] < -0.1).astype(int)
+        )
+
+        # Regime detection (not signals yet - just which regime we're in)
+        is_bullish = ((bullish_scales >= self.min_persistence) & (df["volatility"] > 0)).astype(bool)
+        is_bearish = ((bearish_scales >= self.min_persistence) & (df["volatility"] > 0)).astype(bool)
+        is_bearish = is_bearish & ~is_bullish
+        
+        # Detect CROSSOVERS (regime changes) - signals only happen at transitions
+        # Use numpy roll to compute previous values (avoids pandas fillna downcasting warnings)
+        prev_bullish = np.concatenate(([False], is_bullish.values[:-1].astype(bool)))
+        prev_bearish = np.concatenate(([False], is_bearish.values[:-1].astype(bool)))
+
+        buy_signal = is_bullish.values & ~prev_bullish   # Flip from not-bullish to bullish
+        sell_signal = is_bearish.values & ~prev_bearish  # Flip from not-bearish to bearish
+        # convert boolean numpy arrays back to Series aligned with df.index
+        buy_signal = pd.Series(buy_signal, index=df.index)
+        sell_signal = pd.Series(sell_signal, index=df.index)
+        # Assign signals only on crossovers
+        df["signal"] = 0
+        df.loc[buy_signal, "signal"] = 1
+        df.loc[sell_signal, "signal"] = -1
+        # Position: forward-fill from signals (hold until next flip)
+        df["position"] = 0
+        df.loc[buy_signal, "position"] = 1
+        df.loc[sell_signal, "position"] = -1
+        df["position"] = df["position"].replace(0, np.nan).ffill().fillna(0)
+        
+        df["target_qty"] = df["position"].abs() * self.position_size
+
+        return df
 
 class MovingAverageStrategy(Strategy):
     """
