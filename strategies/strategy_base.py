@@ -65,7 +65,7 @@ class Strategy:
         df = self.generate_signals(df)
         return df
 
-#Adjust Classes/Param as Needed (Jaden Cai test strategy)
+#Adjust Classes/Param as Needed (Jaden Cai test strategy) ##################
 class AlgTopo(Strategy):
     """
     Algebraic Topology Trading Strategy using Persistent Homology concepts.
@@ -154,6 +154,153 @@ class AlgTopo(Strategy):
 
         return df
 
+class MeanReversion(Strategy):
+    """
+    Improved mean reversion strategy using Bollinger Bands and momentum confirmation.
+    
+    Strategy:
+    - Uses SMA as the mean and Bollinger Bands (std deviations) to identify extremes
+    - Only trades when price is >1 std dev away from the mean (statistically extreme)
+    - Confirms mean reversion with momentum: buys when oversold + momentum reverses upward
+    - Avoids trading during strong trends by checking volatility regimes
+    - Only generates signals on band crossovers, not continuously
+    """
+
+##ADJUST SD PARAMS/ MOMENTUM PARAMS AS NEEDED (Jaden Cai test strategy) ############
+    def __init__(self, position_size: float = 10.0, sma_period: int = 20, std_dev: float = 1.5, momentum_period: int = 5, allow_shorts: bool = False):
+        """
+        Args:
+            position_size: shares to trade
+            sma_period: period for the moving average (the mean)
+            std_dev: number of standard deviations for Bollinger Band width
+                     Higher = only trade extreme moves (1.5-2.0 recommended)
+            momentum_period: period for momentum confirmation
+        """
+        if position_size <= 0:
+            raise ValueError("position_size must be positive.")
+        if sma_period < 5:
+            raise ValueError("sma_period must be at least 5.")
+        if std_dev <= 0:
+            raise ValueError("std_dev must be positive.")
+        if momentum_period < 2:
+            raise ValueError("momentum_period must be at least 2.")
+        self.position_size = position_size
+        self.sma_period = sma_period
+        self.std_dev = std_dev
+        self.momentum_period = momentum_period
+        self.stop_loss_pct = 0.03
+        self.take_profit_pct = 0.03
+        self.min_hold = 3
+        self.cooldown_bars = 3
+        self.allow_shorts = bool(allow_shorts)
+
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Calculate the mean
+        df["SMA"] = df["Close"].rolling(self.sma_period, min_periods=1).mean()
+        
+        # Calculate standard deviation
+        df["BB_std"] = df["Close"].rolling(self.sma_period, min_periods=1).std().fillna(0)
+        
+        # Bollinger Bands: mean +/- (std_dev * std)
+        df["BB_upper"] = df["SMA"] + (self.std_dev * df["BB_std"])
+        df["BB_lower"] = df["SMA"] - (self.std_dev * df["BB_std"])
+        
+        # Momentum: rate of change
+        df["momentum"] = df["Close"].pct_change(self.momentum_period).fillna(0)
+        
+        # Z-score for deviation from mean
+        df["z_score"] = (df["Close"] - df["SMA"]) / (df["BB_std"] + 1e-8)
+        
+        # RSI calculation for overbought/oversold detection
+        delta = df["Close"].diff().fillna(0)
+        gain = delta.copy()
+        gain[gain < 0] = 0
+        loss = -delta.copy()
+        loss[loss < 0] = 0
+        
+        avg_gain = gain.rolling(14).mean()
+        avg_loss = loss.rolling(14).mean()
+        rs = avg_gain / (avg_loss + 0.0001)
+        df["RSI"] = 100 - (100 / (1 + rs))
+        df["RSI"] = df["RSI"].fillna(50)
+        
+        return df
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Stateful implementation: iterate rows and manage entry/exit explicitly
+        n = len(df)
+        signals = np.zeros(n, dtype=int)
+        positions = np.zeros(n, dtype=int)
+
+        cur_pos = 0
+        entry_price = 0.0
+        holding = 0
+        cooldown = 0
+
+        for i, idx in enumerate(df.index):
+            close = float(df.at[idx, "Close"])
+            sma = float(df.at[idx, "SMA"])
+            upper = float(df.at[idx, "BB_upper"])
+            lower = float(df.at[idx, "BB_lower"])
+            rsi = float(df.at[idx, "RSI"]) if "RSI" in df.columns else 50.0
+            momentum = float(df.at[idx, "momentum"]) if "momentum" in df.columns else 0.0
+
+            # require a meaningful deviation (z-score) or RSI extreme for entries
+            z = float(df.at[idx, "z_score"]) if "z_score" in df.columns else (close - sma) / (max(1e-8, upper - sma))
+            buy_condition = ((z < -1.2) or (rsi < 30)) and (momentum > 0)
+            sell_condition = ((z > 1.2) or (rsi > 70)) and (momentum < 0)
+            if not self.allow_shorts:
+                sell_condition = False
+
+            # If flat, consider entry (respect cooldown)
+            if cur_pos == 0:
+                if cooldown > 0:
+                    cooldown -= 1
+                else:
+                    if buy_condition:
+                        signals[i] = 1
+                        cur_pos = 1
+                        entry_price = close
+                        holding = 0
+                    elif sell_condition:
+                        signals[i] = -1
+                        cur_pos = -1
+                        entry_price = close
+                        holding = 0
+
+            elif cur_pos == 1:
+                holding += 1
+                # Exit long when price reverts to mean (SMA) after min_hold, or TP/SL triggers
+                if ((holding >= self.min_hold and close >= sma)
+                        or close >= entry_price * (1 + self.take_profit_pct)
+                        or close <= entry_price * (1 - self.stop_loss_pct)):
+                    # exit to flat
+                    signals[i] = 0
+                    cur_pos = 0
+                    entry_price = 0.0
+                    holding = 0
+                    cooldown = self.cooldown_bars
+
+            elif cur_pos == -1:
+                holding += 1
+                # Exit short when price reverts to mean (SMA) after min_hold, or TP/SL triggers
+                if ((holding >= self.min_hold and close <= sma)
+                        or close <= entry_price * (1 - self.take_profit_pct)
+                        or close >= entry_price * (1 + self.stop_loss_pct)):
+                    signals[i] = 0
+                    cur_pos = 0
+                    entry_price = 0.0
+                    holding = 0
+                    cooldown = self.cooldown_bars
+
+            positions[i] = cur_pos
+
+        df["signal"] = signals
+        df["position"] = positions
+        df["target_qty"] = np.abs(df["position"]) * self.position_size
+        return df
+
+############################################################################
 class MovingAverageStrategy(Strategy):
     """
     Moving average crossover strategy with explicitly defined entry/exit rules.
