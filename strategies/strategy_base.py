@@ -40,22 +40,11 @@ import pandas as pd
 class Strategy:
     """
     Base Strategy interface for adding indicators and generating trading signals.
-
-    All strategies must implement:
-        - add_indicators(df): Add technical indicators to the DataFrame
-        - generate_signals(df): Generate trading signals
-
-    The DataFrame must contain these columns:
-        - Datetime, Open, High, Low, Close, Volume (input)
-        - signal, target_qty, position (output from generate_signals)
+    For multi-asset strategies, df can be a dict of DataFrames keyed by symbol.
     """
-
-    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:  # pragma: no cover - interface
-        """Add technical indicators to the DataFrame. Override this method."""
+    def add_indicators(self, df):
         raise NotImplementedError
-
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:  # pragma: no cover - interface
-        """Generate trading signals. Override this method."""
+    def generate_signals(self, df):
         raise NotImplementedError
 
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -303,39 +292,145 @@ class MeanReversion(Strategy):
 ############################################################################
 class MovingAverageStrategy(Strategy):
     """
-    Moving average crossover strategy with explicitly defined entry/exit rules.
+    Moving average crossover strategy. Can operate on a single stock or a portfolio (dict of DataFrames).
     """
-
-    def __init__(self, short_window: int = 20, long_window: int = 60, position_size: float = 10.0):
+    def __init__(self, short_window: int = 3, long_window: int = 7, max_capital: float = 100000.0, risk_pct: float = 0.01, symbols=None):
         if short_window >= long_window:
             raise ValueError("short_window must be strictly less than long_window.")
-        if position_size <= 0:
-            raise ValueError("position_size must be positive.")
         self.short_window = short_window
         self.long_window = long_window
-        self.position_size = position_size
+        self.max_capital = max_capital
+        self.risk_pct = risk_pct
+        self.symbols = symbols
 
-    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def add_indicators(self, df):
+        # If dict, apply to each symbol
+        if isinstance(df, dict):
+            return {s: self.add_indicators(d) for s, d in df.items()}
         df["MA_short"] = df["Close"].rolling(self.short_window, min_periods=1).mean()
         df["MA_long"] = df["Close"].rolling(self.long_window, min_periods=1).mean()
         df["returns"] = df["Close"].pct_change().fillna(0.0)
         df["volatility"] = df["returns"].rolling(self.long_window).std().fillna(0.0)
         return df
 
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+    def pick_signal_stocks(self, stock_dfs: dict) -> list:
+        # Select all stocks where short MA is above or below long MA (bullish or bearish regime)
+        selected = []
+        for symbol, df in stock_dfs.items():
+            if "MA_short" in df.columns and "MA_long" in df.columns:
+                if len(df) > 0 and df["MA_short"].iloc[-1] != df["MA_long"].iloc[-1]:
+                    selected.append(symbol)
+        return selected
+
+    def generate_signals(self, df, state=None):
+        # If dict, treat as portfolio mode
+        if isinstance(df, dict):
+            df = self.add_indicators(df)
+            selected = self.pick_signal_stocks(df)
+            signals = {}
+            if state is None:
+                state = {}
+            for symbol, sdf in df.items():
+                sdf = sdf.copy()
+                symbol_state = state.get(symbol, {})
+                if symbol in selected:
+                    sdf, new_state = self._single_generate_signals(sdf, self.max_capital, symbol_state)
+                    state[symbol] = new_state
+                else:
+                    sdf["signal"] = 0
+                    sdf["position"] = 0
+                    sdf["target_qty"] = 0
+                    state[symbol] = {}
+                signals[symbol] = sdf
+            return signals, state
+        # Single-stock mode
+        sdf, new_state = self._single_generate_signals(df, self.max_capital, state or {})
+        return sdf, new_state
+
+    def _single_generate_signals(self, df, max_capital, state):
         df["signal"] = 0
+        # Add momentum confirmation: only buy if crossover and recent returns > 0, only sell if crossover and recent returns < 0
+        df["recent_return"] = df["Close"].pct_change(3).fillna(0)
+        buy = (
+            (df["MA_short"].shift(1) <= df["MA_long"].shift(1))
+            & (df["MA_short"] > df["MA_long"])
+            & (df["recent_return"] > 0)
+        )
+        sell = (
+            (df["MA_short"].shift(1) >= df["MA_long"].shift(1))
+            & (df["MA_short"] < df["MA_long"])
+            & (df["recent_return"] < 0)
+        )
+        # Position: forward-fill from signals (hold until next flip)
+        position = np.zeros(len(df))
+        position[buy] = 1
+        position[sell] = -1
+        position = pd.Series(position, index=df.index).replace(0, np.nan).ffill().fillna(0)
+        df["position"] = position
+        # Only set signal when position changes from previous bar
+        prev_position = position.shift(1).fillna(0)
+        df.loc[position > prev_position, "signal"] = 1
+        df.loc[position < prev_position, "signal"] = -1
 
-        buy = (df["MA_short"].shift(1) <= df["MA_long"].shift(1)) & (df["MA_short"] > df["MA_long"])
-        sell = (df["MA_short"].shift(1) >= df["MA_long"].shift(1)) & (df["MA_short"] < df["MA_long"])
+        # --- Persistent trailing stop state ---
+        trailing_stop_pct = 0.02
+        # State dict: {'in_position': bool, 'highest_since_entry': float}
+        in_position = state.get('in_position', False)
+        highest_since_entry = state.get('highest_since_entry', None)
+        for i in range(len(df)):
+            if position.iloc[i] == 1:
+                if not in_position:
+                    # Entering long
+                    in_position = True
+                    highest_since_entry = df["Close"].iloc[i]
+                else:
+                    # Update highest price
+                    if df["Close"].iloc[i] > highest_since_entry:
+                        highest_since_entry = df["Close"].iloc[i]
+                    # Check for trailing stop
+                    if df["Close"].iloc[i] < highest_since_entry * (1 - trailing_stop_pct):
+                        df.at[df.index[i], "signal"] = -1
+                        position.iloc[i] = 0
+                        in_position = False
+                        highest_since_entry = None
+            else:
+                in_position = False
+                highest_since_entry = None
+        # Save state for next call
+        new_state = {'in_position': in_position, 'highest_since_entry': highest_since_entry}
 
-        df.loc[buy, "signal"] = 1
-        df.loc[sell, "signal"] = -1
+        # --- Autonomous risk control logic ---
+        # Use recent volatility, price, and volume to size risk
+        recent_vol = df["volatility"].iloc[-20:].mean() if len(df) >= 20 else df["volatility"].mean()
+        recent_price = df["Close"].iloc[-1]
+        avg_volume = df["Volume"].iloc[-20:].mean() if "Volume" in df.columns and len(df) >= 20 else (df["Volume"].mean() if "Volume" in df.columns else 1000)
 
-        df["position"] = 0
-        df.loc[df["MA_short"] > df["MA_long"], "position"] = 1
-        df.loc[df["MA_short"] < df["MA_long"], "position"] = -1
-        df["target_qty"] = df["position"].abs() * self.position_size
-        return df
+        # Dynamic risk: lower risk if volatility is high
+        base_risk_pct = self.risk_pct
+        if recent_vol > 0.03:
+            risk_pct = base_risk_pct * 0.5
+        elif recent_vol < 0.01:
+            risk_pct = base_risk_pct * 1.5
+        else:
+            risk_pct = base_risk_pct
+        risk_pct = min(max(risk_pct, 0.01), 0.10)
+
+        risk_amount = max_capital * risk_pct
+        shares = np.where(df["volatility"] > 0, risk_amount / (df["volatility"] * df["Close"]), 1)
+
+        min_notional = 100.0
+        min_shares = max(1, int(np.floor(min_notional / recent_price)))
+        shares = np.maximum(shares, min_shares)
+
+        max_volume_shares = avg_volume * 0.05
+        shares = np.minimum(shares, max_volume_shares)
+
+        max_capital_shares = (max_capital * 1.0) / recent_price
+        shares = np.minimum(shares, max_capital_shares)
+
+        df["target_qty"] = df["position"].abs() * shares
+        df["target_qty"] = df["target_qty"].round().astype(int)
+        return df, new_state
 
 
 class TemplateStrategy(Strategy):
