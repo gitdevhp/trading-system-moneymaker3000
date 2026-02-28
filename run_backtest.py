@@ -116,6 +116,11 @@ def main() -> None:
     print(f"Max Drawdown: {analyzer.max_drawdown():.4f}")
     print(f"Win Rate: {analyzer.win_rate():.2%}")
 
+    wins = [t.pnl for t in backtester.trades if t.pnl > 0]
+    losses = [t.pnl for t in backtester.trades if t.pnl < 0]
+    print(f"Avg win: {sum(wins)/len(wins):.2f}" if wins else "No wins")
+    print(f"Avg loss: {sum(losses)/len(losses):.2f}" if losses else "No losses")
+    
     if args.plot:
         plot_equity(equity_df)
 

@@ -323,6 +323,8 @@ class MovingAverageStrategy(Strategy):
         return df
 
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+
+
         df["signal"] = 0
 
         buy = (df["MA_short"].shift(1) <= df["MA_long"].shift(1)) & (df["MA_short"] > df["MA_long"])
@@ -466,23 +468,27 @@ class DemoStrategy(Strategy):
 ## To use your strategy:
 ##   python run_live.py --symbol AAPL --strategy mystrategy --live
 ##
-class MomentumStrategy(Strategy):
+class LucasMomentumStrategy(Strategy):
     """Buy when price has strong upward movement, sell when momentum reverses"""
 
-    """ - fast_period: Short MA period (default 5 bars)
-        - slow_period: Long MA period (default 20 bars)  
-        - roc_period: How far back to measure rate of change (default 10 bars)
-        - roc_threshold: Minimum ROC to trigger trade (default 1.5%)
+    """ - fast_period: Short MA period
+        - slow_period: Long MA period 
+        - roc_period: How far back to measure rate of change 
+        - roc_threshold: Minimum ROC to trigger trade 
         - position_size: How many shares/units to trade"""
 
-    def __init__(self, fast_period = 3, slow_period = 12, roc_period = 5, 
-                roc_threshold = 0.01,position_size = 10.0):
+    def __init__(self, fast_period = 3, slow_period = 10, roc_period = 3, 
+                roc_threshold = 0.001, stoch_period = 14, overbought = 80, 
+                oversold = 20, position_size = 26.0):
        
         self.fast_period = fast_period
         self.slow_period = slow_period
         self.roc_period = roc_period
         self.roc_threshold = roc_threshold
         self.position_size = position_size
+        self.stoch_period = stoch_period
+        self.overbought = overbought
+        self.oversold = oversold
 
     def add_indicators(self, df):
 
@@ -491,15 +497,19 @@ class MomentumStrategy(Strategy):
         moving averages as well as rate of change
         """
 
-        # this calculates the moving averages of last 5 and 20 days
+        # this calculates the moving averages of last 3 and 10 bars
         df['ma_fast'] = df['Close'].rolling(window = self.fast_period).mean()
         df['ma_slow'] = df['Close'].rolling(window = self.slow_period).mean()
 
-        # this calculates rate of change based on how long roc_period is
-
+        # this calculates rate of change based of the last 3 bars
         df['roc'] = df['Close'].pct_change(periods = self.roc_period)
 
-        
+        # this calculates the stochastic oscillator, aka where the price
+        # is relative to its recent range
+        low_min = df['Low'].rolling(window = self.stoch_period).min()
+        high_max = df['High'].rolling(window = self.stoch_period).max()
+        df['stoch_k'] = ((df['Close'] - low_min) / (high_max - low_min)) * 100
+
         return df
 
     def generate_signals(self, df):
@@ -516,20 +526,24 @@ class MomentumStrategy(Strategy):
         #buy conditions:
         #1. fast MA > slow MA (meaning that there is an uptrend)
         #2. ROC is positive and strong
-        #BOTH NEED TO BE TRUE
+        #3. stochastic says stock isn't overbought
+        # ALL NEED TO BE TRUE
 
-        buy = (df['ma_fast'] > df['ma_slow']) & (df['roc'] > self.roc_threshold)
+        buy = (df['ma_fast'] > df['ma_slow']) & (df['roc'] > self.roc_threshold) & (df['stoch_k'] < self.overbought)
         df.loc[buy, 'signal'] = 1
 
         #sell conditions:
         #1. fast MA < slow MA (meaning downward trend)
-        #2. ROC negataive and strong
-        # BOTH NEED TO BE TRUE
-        sell = (df['ma_fast'] < df['ma_slow']) & (df['roc'] < self.roc_threshold)
+        #2. ROC negative and strong
+        #3. stochastic says stock isn't oversold
+        # ALL NEED TO BE TRUE
+
+        sell = (df['ma_fast'] < df['ma_slow']) & (df['roc'] < -self.roc_threshold) & (df['stoch_k'] > self.oversold)
         df.loc[sell, 'signal'] = -1
 
         #track position
         df['position'] = df['signal'].replace(0, np.nan).ffill().fillna(0)
+
         df['target_qty'] = self.position_size
 
         return df
