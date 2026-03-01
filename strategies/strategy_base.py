@@ -548,6 +548,13 @@ class LucasMomentumStrategy(Strategy):
         self.stoch_period = stoch_period
         self.overbought = overbought
         self.oversold = oversold
+        self.kelly_f = 0.16
+        self.cash = 100000
+
+    
+    def update_context(self, **kwargs):
+        self.current_position = kwargs.get('position', 0)
+        self.cash = kwargs.get('cash', 100000)
 
     def add_indicators(self, df):
 
@@ -603,6 +610,13 @@ class LucasMomentumStrategy(Strategy):
         #track position
         df['position'] = df['signal'].replace(0, np.nan).ffill().fillna(0)
 
-        df['target_qty'] = self.position_size
+        #tracks cost of current shares
+        current_price = df['Close'].iloc[-1]
+
+        #calculates how many shares to buy based on half of kelly criterion
+        kelly_shares = int((self.cash * self.kelly_f) / current_price)
+
+        #send the call to buy/sell
+        df['target_qty'] = max(1, kelly_shares)
 
         return df

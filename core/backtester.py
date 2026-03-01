@@ -197,7 +197,9 @@ class Backtester:
             market_df = pd.DataFrame(self.market_history)
             if hasattr(self.strategy, "update_context"):
                 try:
-                    self.strategy.update_context(position=self.order_manager.net_position)
+#                   self.strategy.update_context(position=self.order_manager.net_position), lucas edit, this ws og code
+                    self.strategy.update_context(position=self.order_manager.net_position,
+                    cash=self.order_manager.cash)
                 except TypeError:
                     # Backwards compatibility if a strategy ignores context.
                     pass
